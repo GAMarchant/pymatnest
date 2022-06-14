@@ -625,6 +625,8 @@ def usage():
     sys.stderr.write("QUIP_pot_params_file=str (MANDATORY if energy_calculator=quip)\n")
     sys.stderr.write("FORTRAN_model=str (MANDATORY if energy_calculator=fortran)\n")
     sys.stderr.write("FORTRAN_model_params=str (parameters for energy_calculator=fortran)\n")
+    sys.stderr.write("FORTRAN_spin_model=str (MANDATORY if energy_calculator=fortran and magnetic=True)\n")
+    sys.stderr.write("FORTRAN_spin_model_params=str (spin parameters for FORTRAN_spin_model)\n")
     sys.stderr.write("LAMMPS_fix_gmc=[T | F]\n") 
     sys.stderr.write("LAMMPS_init_cmds=str (MANDATORY if energy_calculator=lammps)\n")
     sys.stderr.write("LAMMPS_name=str ('', arch name for lammps shared object file)\n")
@@ -724,6 +726,18 @@ def eval_energy_PE(at):
         energy = energy_internal(at)
     elif do_calc_fortran:
         energy = f_MC_MD.eval_energy(at)
+        if 'initial_magmoms' in at.arrays:
+            energy += f_MC_MD_spin.eval_energy_mag(at)
+            anisotropy_params=np.array(np.matrix(movement_args['cubic_anisotropy'])).ravel()
+            volpatom=at.get_volume()/len(at)
+            if (anisotropy_params[0] != 0) or (anisotropy_params[1] != 0):
+                moments=at.get_initial_magnetic_moments()
+                moments /= np.linalg.norm(moments, axis=1, keepdims=True)
+                for moment in moments:
+                    energy += volpatom*(anisotropy_params[0]*(moment[0]**2*moment[1]**2
+                                                   	+moment[1]**2*moment[2]**2
+                                              	    	+moment[2]**2*moment[0]**2)
+                            	  +anisotropy_params[1]*moment[0]**2*moment[1]**2*moment[2]**2)
     else:
         sys.stderr.write("No way to eval_energy_PE()\n", 5)
 
@@ -750,21 +764,23 @@ def eval_energy_mu(at):
     return energy
 
 def eval_energy_BM(at):
-    if not movement_args['B_field']:
-        energy = 0
-    else:
+    if movement_args['B_field'] is not None:
         field = np.array(np.matrix(movement_args['B_field'])).ravel()
         moments = at.get_initial_magnetic_moments()
         total_mag = np.sum(moments, axis=0)
         g=2
-        energy = -g*np.dot(total_mag, field)
-    return energy
-
-def eval_energy_ME(at): #UNFINISHED
-    if at.has('initial_magmoms'):
-        energy = at.info['E_mag']  
+        muB=5.7883818012e-5
+        energy = -g*muB*np.dot(total_mag, field)
     else:
         energy = 0
+    return energy
+
+
+def eval_energy_ME(at): #UNFINISHED
+    if do_calc_fortran:
+        energy = f_MC_MD_spin.eval_energy_mag(at)
+    else:
+        exit_error('no calculator for magnetic energy', 10)
     return energy
 
 def eval_energy(at, do_KE=True, do_PE=True, do_BM=True):
@@ -824,13 +840,13 @@ def propagate_lammps(at, dt, n_steps, algo, Emax=None, fixed_moments=False):
     else:
         pass
         #pot.lmp.command('unfix 1')
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
             pass
             #pot.lmp.command('unfix B_field')
 
     # set appropriate fix
     if algo == 'NVE':
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
             if fixed_moments:
                 pot.lmp.command('fix 1 all nve') #apply non-magnetic constant energy fix so that moments don't move.
             else:
@@ -854,7 +870,7 @@ def propagate_lammps(at, dt, n_steps, algo, Emax=None, fixed_moments=False):
     # do propagation, recover from exception if needed
     try:
         if algo == 'NVE':
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 if fixed_moments:
                     pot.propagate(at, properties=['energy','forces', 'magmoms', 'magnorm', 'E_mag', 'T_mag'],system_changes=['positions'], n_steps=n_steps, dt=dt, magnetic_field=movement_args['B_field'])
                 else:
@@ -1074,6 +1090,8 @@ def eval_mag_norm(at, vector=False):
         return magnorm
 
 def magmoms_sd_angle(at):
+    if len(at) == 1:
+        return 0
     if not at.has('initial_magmoms'):
         return None
 
@@ -1083,6 +1101,8 @@ def magmoms_sd_angle(at):
 
     for magmom in at.get_initial_magnetic_moments():
         mag_size = np.linalg.norm(magmom)
+        #print(np.dot(magmoms_mean, magmom)/(mean_size*mag_size))
+        
         angle = np.arccos(np.dot(magmoms_mean, magmom)/(mean_size*mag_size))
         angle_sq_sum += angle**2
 
@@ -1090,7 +1110,58 @@ def magmoms_sd_angle(at):
 
     return angle_sd
 
-def spin_swap_flip(at, mmind_1='random', mmind_2='random', swap='random', flip_type='random', max_perturb=np.pi, MC_ratio=0.5, calc_energy=False):
+def cone_rotate(vec,delta_theta,delta_phi):
+    vec_phi = np.arctan2(vec[1],vec[0])
+    vec_theta = np.arccos(vec[2]/np.linalg.norm(vec))
+    vec_zc = np.cos(vec_theta)
+    vec_zs = np.sqrt(1-vec_zc**2)
+    vec_ps = np.sin(vec_phi)
+    vec_pc = np.cos(vec_phi)
+    vec_mat = np.array( [[vec_zc*vec_pc, -vec_ps, vec_zs*vec_pc],
+                            [vec_zc*vec_ps, vec_pc, vec_zs*vec_ps],
+                            [-vec_zs, 0, vec_zc]])
+
+    delta_zc = np.cos(delta_theta)
+    delta_zs = np.sqrt(1-delta_zc**2)
+    delta_ps = np.sin(delta_phi)
+    delta_pc = np.cos(delta_phi)
+    delta_mat = np.array( [[delta_zc*delta_pc, -delta_ps, delta_zs*delta_pc],
+                            [delta_zc*delta_ps, delta_pc, delta_zs*delta_ps],
+                            [-delta_zs, 0, delta_zc]])
+
+    new_vec_mat = np.matmul(vec_mat, delta_mat)
+
+    new_vec = np.matmul(new_vec_mat, np.array([0,0,1]))
+    new_vec *= np.linalg.norm(vec) / np.linalg.norm(new_vec)
+
+    #new_vec = np.matmul(new_vec_mat, vec)
+
+    return new_vec
+
+def axis_rotate(vec,vec_axis,delta_theta,delta_phi):
+
+    m1xm2 = np.cross(vec, vec_axis)
+
+    m1xm1xm2 = np.cross(vec, m1xm2)
+
+    theta_x_mat = np.array( [[0, m1xm2[2], -m1xm2[1]],
+                            [-m1xm2[2], 0, m1xm2[0]],
+                            [m1xm2[1], -m1xm2[0], 0]])
+
+    phi_x_mat = np.array(   [[0, vec_axis[2], -vec_axis[1]],
+                            [-vec_axis[2], 0, vec_axis[0]],
+                            [vec_axis[1], -vec_axis[0], 0]])
+
+    theta_rot_mat = np.eye(3) + np.sin(delta_theta)*theta_x_mat + (1-np.cos(delta_theta))*np.matmul(theta_x_mat, theta_x_mat)
+    phi_rot_mat = np.eye(3) + np.sin(delta_phi)*phi_x_mat + (1-np.cos(delta_phi))*np.matmul(phi_x_mat, phi_x_mat)
+
+    new_vec = np.matmul(theta_rot_mat, vec)
+    new_vec = np.matmul(phi_rot_mat, new_vec)
+    new_vec *= np.linalg.norm(vec) / np.linalg.norm(new_vec)
+
+    return new_vec
+
+def spin_swap_flip(at, mmind_1='random', mmind_2='random', swap='random', flip_type='random', max_perturb=np.pi, MC_ratio=0.5, calc_energy=False, potts_param=0):
 
     if mmind_1 == 'random':
         mmind_1 = rng.int_uniform(0, len(at.arrays['initial_magmoms']))
@@ -1107,7 +1178,7 @@ def spin_swap_flip(at, mmind_1='random', mmind_2='random', swap='random', flip_t
     if flip_type == 'MC':
         MC_step_param = MC_ratio/(MC_ratio+1)
         if rng.float_uniform(0,1) < MC_step_param:
-            flip_type = 7
+            flip_type = 6
         else:
             flip_type = 8
 
@@ -1117,7 +1188,15 @@ def spin_swap_flip(at, mmind_1='random', mmind_2='random', swap='random', flip_t
 
     m1_mag = np.linalg.norm(m1)
 
-    #Rodrigues' rotation formula
+    if potts_param > 0:
+        theta=2*np.pi*rng.int_uniform(1,potts_param)/potts_param
+        rot_mat=[[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]
+        at.arrays['initial_magmoms'][mmind_1][:2] = np.matmul(rot_mat, at.arrays['initial_magmoms'][mmind_1][:2])
+        if calc_energy:
+            energy = eval_energy(at)
+            return energy
+        else:
+            return 
 
     if flip_type == 1:
         at.arrays['initial_magmoms'][mmind_1] = -at.arrays['initial_magmoms'][mmind_1]
@@ -1133,47 +1212,26 @@ def spin_swap_flip(at, mmind_1='random', mmind_2='random', swap='random', flip_t
     elif flip_type == 5:
         at.arrays['initial_magmoms'][mmind_1] = -np.cross(at.arrays['initial_magmoms'][mmind_1], np.cross(at.arrays['initial_magmoms'][mmind_1], at.arrays['initial_magmoms'][mmind_2]))
         at.arrays['initial_magmoms'][mmind_1] *= m1_mag / np.linalg.norm(at.arrays['initial_magmoms'][mmind_1])
-    elif flip_type == 6:
-        theta = rng.float_uniform(-max_perturb,max_perturb)
-        phi = rng.float_uniform(-np.pi,np.pi)
 
-        m1xm2 = np.cross(m1, m2)
+    elif (flip_type == 6):
+        delta_theta = np.arccos(rng.float_uniform(np.cos(max_perturb/2.),1))
+        delta_phi = rng.float_uniform(0 ,2*np.pi)
+        at.arrays['initial_magmoms'][mmind_1] = cone_rotate(at.arrays['initial_magmoms'][mmind_1],delta_theta,delta_phi)
+    
+    elif (flip_type == 8):
+        delta_phi = np.arccos(rng.float_uniform(np.cos(max_perturb/2.),1))
+        #delta_phi = rng.float_uniform(0 , max_perturb*2)
+        rand_bool = 2*rng.int_uniform(0,2)-1
+        rand_vec = np.random.normal(0, 1, 3)
+        for i in range(len(at)):
+            at.arrays['initial_magmoms'][i] = axis_rotate(at.arrays['initial_magmoms'][i], rand_vec, 0, rand_bool*delta_phi)
 
-        m1xm1xm2 = np.cross(m1, m1xm2)
 
-        theta_x_mat = np.array( [[0, m1xm2[2], -m1xm2[1]],
-                            [-m1xm2[2], 0, m1xm2[0]],
-                            [m1xm2[1], -m1xm2[0], 0]])
-
-        phi_x_mat = np.array(   [[0, m2[2], -m2[1]],
-                            [-m2[2], 0, m2[0]],
-                            [m2[1], -m2[0], 0]])
-
-        theta_rot_mat = np.eye(3) + np.sin(theta)*theta_x_mat + (1-np.cos(theta))*np.matmul(theta_x_mat, theta_x_mat)
-        phi_rot_mat = np.eye(3) + np.sin(phi)*phi_x_mat + (1-np.cos(phi))*np.matmul(phi_x_mat, phi_x_mat)
-
-        at.arrays['initial_magmoms'][mmind_1] = np.matmul(theta_rot_mat, at.arrays['initial_magmoms'][mmind_1])
-        at.arrays['initial_magmoms'][mmind_1] = np.matmul(phi_rot_mat, at.arrays['initial_magmoms'][mmind_1])
-        at.arrays['initial_magmoms'][mmind_1] *= m1_mag / np.linalg.norm(at.arrays['initial_magmoms'][mmind_1])
-        #at.arrays['initial_magmoms'][mmind_1] += np.random.normal(0, max_perturb, 3)
-        #at.arrays['initial_magmoms'][mmind_1] *= m1_mag / np.linalg.norm(at.arrays['initial_magmoms'][mmind_1])
     elif flip_type == 7:
-        pot.lmp.command("#ONE SPIN")
         at.arrays['initial_magmoms'][mmind_1] /= m1_mag
         at.arrays['initial_magmoms'][mmind_1] += np.random.normal(0, max_perturb, 3)
         at.arrays['initial_magmoms'][mmind_1] *= m1_mag / np.linalg.norm(at.arrays['initial_magmoms'][mmind_1])
-    elif flip_type == 8:
-        pot.lmp.command("#ALL SPINS")
-        delta_zc = rng.float_uniform(-1,1)
-        delta_zs = np.sqrt(1-delta_zc**2)
-        delta_phi = rng.float_uniform(0,2*np.pi)
-        delta_ps = np.sin(delta_phi)
-        delta_pc = np.cos(delta_phi)
-        delta_mat = np.array( [[delta_zc*delta_pc, -delta_ps, delta_zs*delta_pc],
-                            [delta_zc*delta_ps, delta_pc, delta_zs*delta_ps],
-                            [-delta_zs, 0, delta_zc]])
-        for i in range(len(at)):
-            at.arrays['initial_magmoms'][i] = np.matmul(delta_mat, at.arrays['initial_magmoms'][i])
+    
     else:
         pass
 
@@ -1199,7 +1257,7 @@ def do_MD_spin_walk(at, movement_args, Emax, KEmax):
 
     pre_MD_pos = at.get_positions()
     pre_MD_velo = at.get_velocities()
-    if movement_args['magnetic']:
+    if ns_args['magnetic']:
         pre_MD_moms = at.get_initial_magnetic_moments()
     if ns_args['n_extra_data'] > 0:
         pre_MD_extra_data = at.arrays['ns_extra_data'].copy()
@@ -1282,7 +1340,7 @@ def do_MD_spin_walk(at, movement_args, Emax, KEmax):
         #DOC \item set positions, velocities, energy back to value before perturbation (maybe should be after?)
         # print(print_prefix, ": WARNING: reject MD traj Emax ", Emax, " initial E ", orig_E, " velo perturbed E ", pre_MD_E, " final E ",final_E, " KEmax ", KEmax, " KE ", final_KE)
         at.set_positions(pre_MD_pos)
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
             at.set_initial_magnetic_moments(pre_MD_moms)
         if movement_args['MD_atom_velo_flip_accept']:
             at.set_velocities(pre_MD_velo)
@@ -1290,8 +1348,10 @@ def do_MD_spin_walk(at, movement_args, Emax, KEmax):
             at.set_velocities(-pre_MD_velo)
         if ns_args['n_extra_data'] > 0:
             at.arrays['ns_extra_data'][...] = pre_MD_extra_data
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
+            at.info['mag_energy'] = eval_energy_ME(at)
             at.info['mag_norm'] = eval_mag_norm(at)
+            at.info['mag_nvec'] = eval_mag_norm(at, vector=True)
             at.info['mag_sd_angle'] = magmoms_sd_angle(at)/(2*np.pi)*360
         at.info['ns_energy'] = pre_MD_E
 
@@ -1314,8 +1374,10 @@ def do_MD_spin_walk(at, movement_args, Emax, KEmax):
                 else:
                     at.set_initial_magnetic_moments(pre_flip_moms)
 
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
+            at.info['mag_energy'] = eval_energy_ME(at)
             at.info['mag_norm'] = eval_mag_norm(at)
+            at.info['mag_nvec'] = eval_mag_norm(at, vector=True)
             at.info['mag_sd_angle'] = magmoms_sd_angle(at)/(2*np.pi)*360
         at.info['ns_energy'] = final_E
         n_accept = 1
@@ -1346,7 +1408,7 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
         do_MC_atom_velo_walk(at, movement_args, Emax, nD, KEmax)
 
     pre_MD_pos = at.get_positions()
-    if movement_args['magnetic']:
+    if ns_args['magnetic']:
         pre_MD_moms = at.get_initial_magnetic_moments()
     pre_MD_velo = at.get_velocities()
     if ns_args['n_extra_data'] > 0:
@@ -1404,7 +1466,7 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
         #DOC \item set positions, velocities, energy back to value before perturbation (maybe should be after?)
         # print(print_prefix, ": WARNING: reject MD traj Emax ", Emax, " initial E ", orig_E, " velo perturbed E ", pre_MD_E, " final E ",final_E, " KEmax ", KEmax, " KE ", final_KE)
         at.set_positions(pre_MD_pos)
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
             at.set_initial_magnetic_moments(pre_MD_moms)
         if movement_args['MD_atom_velo_flip_accept']:
             at.set_velocities(pre_MD_velo)
@@ -1412,8 +1474,10 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
             at.set_velocities(-pre_MD_velo)
         if ns_args['n_extra_data'] > 0:
             at.arrays['ns_extra_data'][...] = pre_MD_extra_data
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
+            at.info['mag_energy'] = eval_energy_ME(at)
             at.info['mag_norm'] = eval_mag_norm(at)
+            at.info['mag_nvec'] = eval_mag_norm(at,vector=True)
         at.info['ns_energy'] = pre_MD_E
         n_accept = 0
     #DOC \item else
@@ -1422,8 +1486,10 @@ def do_MD_atom_walk(at, movement_args, Emax, KEmax):
         # remember to reverse velocities on acceptance to preserve detailed balance, since velocity is (sometimes) being perturbed, not completely randomized
         if movement_args['MD_atom_velo_flip_accept']:
             at.set_velocities(-at.get_velocities()) # is there a faster way of doing this in ASE?  Can you do at.velocities?
-        if movement_args['magnetic']:
+        if ns_args['magnetic']:
+            at.info['mag_energy'] = eval_energy_ME(at)
             at.info['mag_norm'] = eval_mag_norm(at)
+            at.info['mag_nvec'] = eval_mag_norm(at,vector=True)
         at.info['ns_energy'] = final_E
         n_accept = 1
 
@@ -1454,7 +1520,10 @@ def do_MC_spin_walk(at, movement_args, Emax):
         orig_moms = at.get_initial_magnetic_moments()
         if ns_args['n_extra_data'] > 0:
             orig_extra_data = at.arrays['ns_extra_data'].copy()
-        energy = spin_swap_flip(at, mmind_1='random', mmind_2='random', swap=0, flip_type='MC', max_perturb=magmoms_sd_angle(at), MC_ratio=step_size, calc_energy=True)
+        if movement_args['potts_param'] > 0:
+            energy = spin_swap_flip(at, mmind_1='random', mmind_2='random', swap=0, flip_type='MC', max_perturb=magmoms_sd_angle(at), MC_ratio=step_size, calc_energy=True, potts_param=movement_args['potts_param'])
+        else:
+            energy = spin_swap_flip(at, mmind_1='random', mmind_2='random', swap=0, flip_type='MC', max_perturb=step_size, MC_ratio=0.5, calc_energy=True) # len(at), calc_energy=True)
         #DOC \item accept/reject on E < Emax
         if energy >= Emax:
             # reject move
@@ -1465,7 +1534,9 @@ def do_MC_spin_walk(at, movement_args, Emax):
         else:
             n_accept += 1
         at.info['ns_energy'] = energy
+        at.info['mag_energy'] = eval_energy_ME(at)
         at.info['mag_norm'] = eval_mag_norm(at)
+        at.info['mag_nvec'] = eval_mag_norm(at,vector=True) 
         at.info['mag_sd_angle'] = magmoms_sd_angle(at)/(2*np.pi)*360
         at.info['BM_energy'] = eval_energy_BM(at)
 
@@ -2103,12 +2174,20 @@ def max_energy(walkers, n, kinetic_only=False, magnetic=False):
         energies_loc = np.array([ at.info['ns_energy'] for at in walkers])
     volumes_loc = np.array([ at.get_volume() for at in walkers])
     if magnetic:
-        magnorms_loc = np.array([ eval_mag_norm(at) for at in walkers])
+        magnorms_loc = np.array([ at.info['mag_norm'] for at in walkers])
+        mag_xs_loc = np.array([ at.info['mag_nvec'][0] for at in walkers])
+        mag_ys_loc = np.array([ at.info['mag_nvec'][1] for at in walkers])
+        mag_zs_loc = np.array([ at.info['mag_nvec'][2] for at in walkers])
+
     if comm is not None:
         energies = np.zeros( (comm.size*len(energies_loc)) )
         volumes = np.zeros( (comm.size*len(volumes_loc)) )
         if magnetic:
             magnorms = np.zeros( (comm.size*len(magnorms_loc)) )
+            mag_xs = np.zeros( (comm.size*len(mag_xs_loc)) )
+            mag_ys = np.zeros( (comm.size*len(mag_ys_loc)) )
+            mag_zs = np.zeros( (comm.size*len(mag_zs_loc)) )
+
         # comm.barrier() #BARRIER
         comm.Allgather( [ energies_loc, MPI.DOUBLE ], [ energies, MPI.DOUBLE ] )
         energies = energies.flatten()
@@ -2116,12 +2195,23 @@ def max_energy(walkers, n, kinetic_only=False, magnetic=False):
         volumes = volumes.flatten()
         if magnetic:
             comm.Allgather( [ magnorms_loc, MPI.DOUBLE ], [ magnorms, MPI.DOUBLE ] )
+            comm.Allgather( [ mag_xs_loc, MPI.DOUBLE ], [ mag_xs, MPI.DOUBLE ] )
+            comm.Allgather( [ mag_ys_loc, MPI.DOUBLE ], [ mag_ys, MPI.DOUBLE ] )
+            comm.Allgather( [ mag_zs_loc, MPI.DOUBLE ], [ mag_zs, MPI.DOUBLE ] )
+
             magnorms = magnorms.flatten()
+            mag_xs = mag_xs.flatten()
+            mag_ys = mag_ys.flatten()
+            mag_zs = mag_zs.flatten()
+
     else:
         energies = energies_loc
         volumes = volumes_loc
         if magnetic:
             magnorms = magnorms_loc
+            mag_xs = mag_xs_loc
+            mag_ys = mag_ys_loc
+            mag_zs = mag_zs_loc
 
     # n is n_cull
     Emax_ind = energies.argsort()[-1:-n-1:-1]
@@ -2129,13 +2219,16 @@ def max_energy(walkers, n, kinetic_only=False, magnetic=False):
     Vmax = volumes[Emax_ind]
     if magnetic:
         Mmax = magnorms[Emax_ind]
+        M_xmax = mag_xs[Emax_ind]
+        M_ymax = mag_ys[Emax_ind]
+        M_zmax = mag_zs[Emax_ind]
     
     # WARNING: assumes that each node has equal number of walkers
     rank_of_max = np.floor(Emax_ind/len(walkers)).astype(int)
     ind_of_max = np.mod(Emax_ind,len(walkers))
 
     if magnetic:
-        return (Emax, Vmax, Mmax, rank_of_max, ind_of_max)
+        return (Emax, Vmax, Mmax, M_xmax, M_ymax, M_zmax, rank_of_max, ind_of_max)
     else:
         return (Emax, Vmax, rank_of_max, ind_of_max)
 
@@ -2712,13 +2805,13 @@ def do_ns_loop():
     for at in walkers:
         at.info['KEmax']=KEmax 
         if movement_args['MC_cell_P'] > 0:
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( rank, ": initial enthalpy ", at.info['ns_energy'], " PE ", eval_energy_PE(at), " KE ", eval_energy_KE(at), " PV ", eval_energy_PV(at), " mu ", eval_energy_mu(at), ' MB ', eval_energy_BM(at), " vol ", at.get_volume(), ' mag ', eval_mag_norm(at) )
             else:
                 print( rank, ": initial enthalpy ", at.info['ns_energy'], " PE ", eval_energy_PE(at), " KE ", eval_energy_KE(at), " PV ", eval_energy_PV(at), " mu ", eval_energy_mu(at), " vol ", at.get_volume())
 
         else:
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( rank, ": initial enthalpy ", at.info['ns_energy'], " PE ", eval_energy_PE(at), " KE ", eval_energy_KE(at), " mu ", eval_energy_mu(at), ' MB ', eval_energy_BM(at), " vol ", at.get_volume(), ' mag ', eval_mag_norm(at) )
             else:
                 print( rank, ": initial enthalpy ", at.info['ns_energy'], " PE ", eval_energy_PE(at), " KE ", eval_energy_KE(at), " mu ", eval_energy_mu(at), " vol ", at.get_volume())
@@ -2806,13 +2899,13 @@ def do_ns_loop():
                     print( print_prefix, "LIVIA 3, something wrong", eval_energy(at), at.info['ns_energy'])
             print( print_prefix, "%30s" % ": LOOP_PE START 01 ",i_ns_step, [ "%.10f" % eval_energy(at, do_KE=False) for at in walkers ])
             print( print_prefix, "%30s" % ": LOOP_X START 02 ",i_ns_step, [ "%.10f" % at.positions[0,0] for at in walkers ])
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( print_prefix, "%30s" % ": LOOP_MX START 03 ",i_ns_step, [ "%.10f" % at.get_initial_magnetic_moments()[0,2] for at in walkers ])
                 #print( print_prefix, "%30s" % ": LOOP_ME START 04 ",i_ns_step, [ "%.10f" % eval_energy_ME(at) for at in walkers ]) 
             
         # get list of highest energy configs
-        if movement_args['magnetic']:
-            (Emax, Vmax, Mmax, cull_rank, cull_ind) = max_energy(walkers, n_cull, magnetic=True)
+        if ns_args['magnetic']:
+            (Emax, Vmax, Mmax, M_xmax, M_ymax, M_zmax, cull_rank, cull_ind) = max_energy(walkers, n_cull, magnetic=True)
         else:
             (Emax, Vmax, cull_rank, cull_ind) = max_energy(walkers, n_cull)
         
@@ -2893,9 +2986,9 @@ def do_ns_loop():
 
         # record Emax walkers energies
         if rank == 0:
-            if movement_args['magnetic']:
-                for (E, V, M) in zip(Emax, Vmax, Mmax):
-                    energy_io.write("%d %.60f %.60f %.60f\n" % (i_ns_step, E, V, M))
+            if ns_args['magnetic']:
+                for (E, V, M, Mx, My, Mz) in zip(Emax, Vmax, Mmax, M_xmax, M_ymax, M_zmax):
+                    energy_io.write("%d %.60f %.60f %.60f %.10f %.10f %.10f\n" % (i_ns_step, E, V, M, Mx, My, Mz))
             else:
                 for (E, V) in zip(Emax, Vmax):
                     energy_io.write("%d %.60f %.60f\n" % (i_ns_step, E, V))
@@ -3066,7 +3159,7 @@ def do_ns_loop():
             print( print_prefix, "%30s" % ": LOOP_ns_energy POST_LOC_CLONE 15 ", i_ns_step, ["%.10f" % at.info['ns_energy'] for at in walkers] )
             print( print_prefix, "%30s" % ": LOOP_PE POST_LOC_CLONE 16 ",i_ns_step, [ "%.10f" % eval_energy(at, do_KE=False) for at in walkers ])
             print( print_prefix, "%30s" % ": LOOP_X POST_LOC_CLONE 17 ",i_ns_step, [ "%.10f" % at.positions[0,0] for at in walkers ])
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( print_prefix, "%30s" % ": LOOP_MX POST_LOC_CLONE 18 ",i_ns_step, [ "%.10f" % at.get_initial_magnetic_moments()[0,2] for at in walkers ])
                 #print( print_prefix, "%30s" % ": LOOP_ME POST_LOC_CLONE 19 ",i_ns_step, [ "%.10f" % eval_energy_ME(at) for at in walkers ])
 
@@ -3088,7 +3181,7 @@ def do_ns_loop():
             if send_rank[0] == recv_rank[0] and send_rank[0] == rank: # local copy
                 walkers[recv_ind[0]].set_positions(walkers[send_ind[0]].get_positions())
                 walkers[recv_ind[0]].set_cell(walkers[send_ind[0]].get_cell())
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     walkers[recv_ind[0]].set_initial_magnetic_moments(walkers[send_ind[0]].get_initial_magnetic_moments())
                 if movement_args['do_velocities']:
                     walkers[recv_ind[0]].set_velocities(walkers[send_ind[0]].get_velocities())
@@ -3109,7 +3202,7 @@ def do_ns_loop():
                     walkers[recv_ind[0]].info['n_walks'] = 0
             else: # need send/recv
                 n_send = 3*(n_atoms + 3)
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     n_send += 3*n_atoms
                 if movement_args['do_velocities']:
                     n_send += 3*n_atoms
@@ -3128,7 +3221,7 @@ def do_ns_loop():
                     buf_o = 0
                     buf[buf_o:buf_o+3*n_atoms] = walkers[send_ind[0]].get_positions().reshape( (3*n_atoms) ); buf_o += 3*n_atoms
                     buf[buf_o:buf_o+3*3] = walkers[send_ind[0]].get_cell().reshape( (3*3) ); buf_o += 3*3
-                    if movement_args['magnetic']:
+                    if ns_args['magnetic']:
                         buf[buf_o:buf_o+3*n_atoms] = walkers[send_ind[0]].get_initial_magnetic_moments().reshape( (3*n_atoms) ); buf_o += 3*n_atoms
                     if movement_args['do_velocities']:
                         buf[buf_o:buf_o+3*n_atoms] = walkers[send_ind[0]].get_velocities().reshape( (3*n_atoms) ); buf_o += 3*n_atoms
@@ -3150,7 +3243,7 @@ def do_ns_loop():
                     buf_o = 0
                     walkers[recv_ind[0]].set_positions(buf[buf_o:buf_o+3*n_atoms].reshape( (n_atoms, 3) )); buf_o += 3*n_atoms
                     walkers[recv_ind[0]].set_cell(buf[buf_o:buf_o+3*3].reshape( (3, 3) )); buf_o += 3*3
-                    if movement_args['magnetic']:
+                    if ns_args['magnetic']:
                         walkers[recv_ind[0]].set_initial_magnetic_moments(buf[buf_o:buf_o+3*n_atoms].reshape( (n_atoms, 3) )); buf_o += 3*n_atoms
                     if movement_args['do_velocities']:
                         walkers[recv_ind[0]].set_velocities(buf[buf_o:buf_o+3*n_atoms].reshape( (n_atoms, 3) )); buf_o += 3*n_atoms
@@ -3171,7 +3264,7 @@ def do_ns_loop():
         else: # complicated construction of sending/receiving buffers
             # figure out how much is sent per config
             n_data_per_config = 1+3*(n_atoms + 3)
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 n_data_per_config += 3*n_atoms
             if movement_args['do_velocities']:
                 n_data_per_config += 3*n_atoms
@@ -3212,7 +3305,7 @@ def do_ns_loop():
                 send_data[data_o] = walkers[i_send].info['ns_energy']; data_o += 1
                 send_data[data_o:data_o+3*n_atoms] = walkers[i_send].get_positions().reshape( (3*n_atoms) ); data_o += 3*n_atoms
                 send_data[data_o:data_o+3*3] = walkers[i_send].get_cell().reshape( (3*3) ); data_o += 3*3
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     send_data[data_o:data_o+3*n_atoms] = walkers[i_send].get_initial_magnetic_moments().reshape( (3*n_atoms) ); data_o += 3*n_atoms
                 if movement_args['do_velocities']:
                     send_data[data_o:data_o+3*n_atoms] = walkers[i_send].get_velocities().reshape( (3*n_atoms) ); data_o += 3*n_atoms
@@ -3264,7 +3357,7 @@ def do_ns_loop():
                 walkers[i_recv].info['ns_energy'] = recv_data[data_o]; data_o += 1
                 walkers[i_recv].set_positions( recv_data[data_o:data_o+3*n_atoms].reshape( (n_atoms, 3) )); data_o += 3*n_atoms
                 walkers[i_recv].set_cell( recv_data[data_o:data_o+3*3].reshape( (3, 3) )); data_o += 3*3
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     walkers[i_recv].set_initial_magnetic_moments( recv_data[data_o:data_o+3*n_atoms].reshape( (n_atoms, 3) )); data_o += 3*n_atoms
                 if movement_args['do_velocities']:
                     walkers[i_recv].set_velocities( recv_data[data_o:data_o+3*n_atoms].reshape( (n_atoms, 3) )); data_o += 3*n_atoms
@@ -3287,7 +3380,7 @@ def do_ns_loop():
             print( print_prefix, "%30s" % ": LOOP_ns_energy POST_CLONE 20 ", i_ns_step, ["%.10f" % at.info['ns_energy'] for at in walkers] )
             print( print_prefix, "%30s" % ": LOOP_PE POST_CLONE 21 ",i_ns_step, [ "%.10f" % eval_energy(at, do_KE=False) for at in walkers ])
             print( print_prefix, "%30s" % ": LOOP_X POST_CLONE 22 ",i_ns_step, [ "%.10f" % at.positions[0,0] for at in walkers ])
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( print_prefix, "%30s" % ": LOOP_MX POST_CLONE 23 ",i_ns_step, [ "%.10f" % at.get_initial_magnetic_moments()[0,2] for at in walkers ])
                 #print( print_prefix, "%30s" % ": LOOP_ME POST_CLONE 24 ",i_ns_step, [ "%.10f" % eval_energy_ME(at) for at in walkers ])
 
@@ -3359,7 +3452,7 @@ def do_ns_loop():
             print( print_prefix, "%30s" % ": LOOP_ns_energy POST_CLONE_WALK 25 ", i_ns_step, ["%.10f" % at.info['ns_energy'] for at in walkers] )
             print( print_prefix, "%30s" % ": LOOP_PE POST_CLONE_WALK 26 ",i_ns_step, [ "%.10f" % eval_energy(at, do_KE=False) for at in walkers ])
             print( print_prefix, "%30s" % ": LOOP_X POST_CLONE_WALK 27 ",i_ns_step, [ "%.10f" % at.positions[0,0] for at in walkers ])
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( print_prefix, "%30s" % ": LOOP_MX POST_CLONE_WALK 28 ",i_ns_step, [ "%.10f" % at.get_initial_magnetic_moments()[0,2] for at in walkers ])
                 #print( print_prefix, "%30s" % ": LOOP_ME POST_CLONE_WALK 29 ",i_ns_step, [ "%.10f" % eval_energy_ME(at) for at in walkers ])
 
@@ -3436,7 +3529,7 @@ def do_ns_loop():
             print( print_prefix, "%30s" % ": LOOP_ns_energy END 30 ", i_ns_step, ["%.10f" % at.info['ns_energy'] for at in walkers] )
             print( print_prefix, "%30s" % ": LOOP_PE END 31 ",i_ns_step, [ "%.10f" % eval_energy(at,do_KE=False) for at in walkers ])
             print( print_prefix, "%30s" % ": LOOP_X END 32 ",i_ns_step, [ "%.10f" % at.positions[0,0] for at in walkers ])
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 print( print_prefix, "%30s" % ": LOOP_MX END 33 ",i_ns_step, [ "%.10f" % at.get_initial_magnetic_moments()[0,2] for at in walkers ])
                 #print( print_prefix, "%30s" % ": LOOP_ME END 34 ",i_ns_step, [ "%.10f" % eval_energy_ME(at) for at in walkers ])
             
@@ -3530,7 +3623,7 @@ def main():
         global do_calc_quip, do_calc_lammps, do_calc_internal, do_calc_fortran
         global energy_io, traj_io, walkers
         global n_atoms, KEmax, pot
-        global MPI, quippy, f_MC_MD
+        global MPI, quippy, f_MC_MD, f_MC_MD_spin
         global track_traj_io, cur_config_ind
         global E_dump_io
         global print_prefix
@@ -3700,10 +3793,12 @@ def main():
             sys.stderr.write("WARNING: got DEPRECATED start_energy_ceiling\n")
         ns_args['random_init_max_n_tries'] = int(args.pop('random_init_max_n_tries', 100))
 
-
+        
 
         ns_args['KEmax_max_T'] = float(args.pop('KEmax_max_T', -1))
         ns_args['kB'] = float(args.pop('kB', 8.6173324e-5)) # eV/K
+
+        ns_args['magnetic'] = str_to_logical(args.pop('magnetic', "F"))
 
         # parse energy_calculator
         ns_args['energy_calculator'] = args.pop('energy_calculator', 'fortran')
@@ -3761,7 +3856,17 @@ def main():
             except:
                 exit_error("need FORTRAN model FORTRAN_model\n",1)
             ns_args['FORTRAN_model_params'] = args.pop('FORTRAN_model_params', '0')
+            if ns_args['magnetic']:
+                try:
+                    ns_args['FORTRAN_spin_model'] = args.pop('FORTRAN_spin_model')
+                except:
+                    exit_error("need FORTRAN spin model FORTRAN_spin_model\n",1)
+                ns_args['FORTRAN_spin_model_params'] = args.pop('FORTRAN_spin_model_params', '0')
             f_MC_MD = fortranMCMDpy.fortran_MC_MD(ns_args['FORTRAN_model'])
+            if ns_args['magnetic']:
+                f_MC_MD_spin = fortranMCMDpy.fortran_MC_MD(ns_args['FORTRAN_spin_model'], magnetic=True)
+                spin_params = np.array([ float(x) for x in ns_args['FORTRAN_spin_model_params'].split() ])
+                f_MC_MD_spin.init_model(spin_params)
             params = np.array([ float(x) for x in ns_args['FORTRAN_model_params'].split() ])
             f_MC_MD.init_model(params)
         else:
@@ -3936,8 +4041,8 @@ def main():
         movement_args['MC_atom_Galilean'] = str_to_logical(args.pop('MC_atom_Galilean', "F"))
         movement_args['GMC_no_reverse'] = str_to_logical(args.pop('GMC_no_reverse', "T"))
         
-        movement_args['MC_spin_step_size'] = float(args.pop('MC_spin_step_size', 0.1))
-        movement_args['MC_spin_step_size_max'] = float(args.pop('MC_spin_step_size_max', 10))
+        movement_args['MC_spin_step_size'] = float(args.pop('MC_spin_step_size', 3.14159))
+        movement_args['MC_spin_step_size_max'] = float(args.pop('MC_spin_step_size_max', 6.28318))
         
         movement_args['do_velocities'] = (movement_args['atom_algorithm'] == 'MD' or movement_args['MC_atom_velocities'])
         movement_args['fixed_positions'] = str_to_logical(args.pop('fixed_positions', "F"))
@@ -4013,17 +4118,13 @@ def main():
 
         movement_args['2D'] = str_to_logical(args.pop('2D', "F"))
 
-        movement_args['magnetic'] = str_to_logical(args.pop('magnetic', "F"))
-
         movement_args['fixed_moments'] = str_to_logical(args.pop('fixed_moments', "F"))
-
         movement_args['set_moments'] = args.pop('set_moments', '')
-
         movement_args['spin_step_fixed_pos'] = str_to_logical(args.pop('spin_step_fixed_pos', "F"))
-
         movement_args['MD_spin_flip_trials'] = int(args.pop('MD_spin_flip_trials', "0"))
-
-        movement_args['B_field'] = str(args.pop('B_field', ""))
+        movement_args['B_field'] = str(args.pop('B_field', "[0, 0, 0]"))
+        movement_args['potts_param'] = int(args.pop('potts_param', "0"))
+        movement_args['cubic_anisotropy'] = str(args.pop('cubic_anisotropy', "[0, 0]"))
 
         if 'QUIP_pot_params_file' in ns_args:
             if not have_quippy:
@@ -4076,7 +4177,7 @@ def main():
             pass
         elif do_calc_lammps:
             init_cmds = [s.strip() for s in ns_args['LAMMPS_init_cmds'].split(';')]
-            if movement_args['magnetic']:
+            if ns_args['magnetic']:
                 B_field = movement_args['B_field']
                 #init_cmds += [f"fix B_field all precession/spin zeeman {B_field}"]
                 #init_cmds += [f"fix_modify B_field energy yes"]
@@ -4293,7 +4394,7 @@ def main():
                     config_ind = comm.rank*n_walkers
             for at in walkers:
                 at.set_velocities(np.zeros( (len(walkers[0]), 3) ))
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     at.set_initial_magnetic_moments(np.zeros( (len(walkers[0]), 3) ))
                 if ns_args['track_configs']:
                     at.info['config_ind'] = config_ind
@@ -4346,7 +4447,7 @@ def main():
             for (i_at, at) in enumerate(walkers):
                 # randomize cell if P is set, both volume (from appropriate distribution) and shape (from uniform distribution with min aspect ratio limit)
 
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     moments = np.zeros((len(at),3))
                     moments[:,2] = 1e-20
                     at.set_initial_magnetic_moments( moments )
@@ -4392,7 +4493,7 @@ def main():
                     if math.isnan(energy) or energy > ns_args['start_energy_ceiling']:
                         exit_error("Rank %d failed to generate initial config by random, fortran, or (atom by atom addition) python initializer under max energy %f in %d tries each\n" % (rank, ns_args['start_energy_ceiling'], ns_args['random_init_max_n_tries']), 4)
                 
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
                     if ns_args['random_initialise_moms']:
                         moments = rng.normal(1, (len(at), 3))
                         for moment in moments:
@@ -4401,7 +4502,7 @@ def main():
                             moment[2] = 1
                         at.set_initial_magnetic_moments( moments )
                         n_try = 0
-                        while eval_mag_norm(at) > 0.05 and n_try < ns_args['random_init_max_n_tries']*5:
+                        while eval_mag_norm(at) > 0.05 and n_try < ns_args['random_init_max_n_tries']:
                             moments = rng.normal(1.0, (len(at), 3))
                             i = 0
                             for moment in moments:
@@ -4430,14 +4531,23 @@ def main():
                         at.set_initial_magnetic_moments( moments )
                     if movement_args['2D']:
                         moments[:,2] = 0
+                        if movement_args['potts_param'] > 0:
+                            for moment in moments:
+                                potts_n = rng.int_uniform(0, movement_args['potts_param'])
+                                moment[0] = np.cos(2*np.pi*potts_n/movement_args['potts_param'])
+                                moment[1] = np.sin(2*np.pi*potts_n/movement_args['potts_param'])
+                        
                         moments /= np.linalg.norm(moments, axis=1, keepdims=True) / 2.2
                         at.set_initial_magnetic_moments( moments )
+
              
                 energy = eval_energy(at)
                 at.info['ns_energy'] = rand_perturb_energy(energy, ns_args['random_energy_perturbation'])
                 at.info['volume'] = at.get_volume()
-                if movement_args['magnetic']:
+                if ns_args['magnetic']:
+                    at.info['mag_energy'] = eval_energy_ME(at)
                     at.info['mag_norm'] = eval_mag_norm(at)
+                    at.info['mag_nvec'] = eval_mag_norm(at, vector=True)
                     at.info['mag_sd_angle'] = magmoms_sd_angle(at)/(2*np.pi)*360
                     at.info['BM_energy'] = eval_energy_BM(at)
 
