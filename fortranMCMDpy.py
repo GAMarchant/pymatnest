@@ -4,7 +4,7 @@ import numpy as np
 import os, ase
 
 class fortran_MC_MD:
-    def __init__(self, model_so):
+    def __init__(self, model_so, magnetic=False):
         if model_so.find("/") == 0:
             self.model_lib = ctypes.CDLL(model_so, mode=ctypes.RTLD_GLOBAL)
         else:
@@ -18,7 +18,24 @@ class fortran_MC_MD:
         self.model_lib.ll_init_model_.argtypes = [ctypes.c_void_p, # N_params
            ndpointer(ctypes.c_double, flags="C_CONTIGUOUS") ] # params
 
-        # ll_init_config
+        if magnetic:
+            # ll_init_config_mag
+            self.model_lib.ll_init_config_mag_.argtypes = [ctypes.c_void_p, # N
+               ndpointer(ctypes.c_int, flags="C_CONTIGUOUS"), # Z
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # pos
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # mom
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # cell
+               ctypes.c_void_p ] # Emax
+
+            # ll_eval_energy_mag
+            self.model_lib.ll_eval_energy_mag_.restype = ctypes.c_double
+            self.model_lib.ll_eval_energy_mag_.argtypes = [ctypes.c_void_p, # N
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # pos
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # mom
+               ctypes.c_void_p, # n_extra_data
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # extra_data
+               ndpointer(ctypes.c_double, flags="C_CONTIGUOUS")] # cell
+
         self.model_lib.ll_init_config_.argtypes = [ctypes.c_void_p, # N
            ndpointer(ctypes.c_int, flags="C_CONTIGUOUS"), # Z
            ndpointer(ctypes.c_double, flags="C_CONTIGUOUS"), # pos
@@ -142,7 +159,10 @@ class fortran_MC_MD:
     def init_config(self, at, Emax):
         n = ctypes.c_int(len(at))
         Emax = ctypes.c_double(Emax)
-        self.model_lib.ll_init_config_(ctypes.byref(n), at.get_atomic_numbers().astype(np.int32), at.get_positions(), at.get_cell()[:,:], ctypes.byref(Emax))
+        if 'initial_magmoms' in at.arrays:
+            self.model_lib.ll_init_config_mag_(ctypes.byref(n), at.get_atomic_numbers().astype(np.int32), at.get_positions(), at.get_initial_magnetic_moments(), at.get_cell()[:,:], ctypes.byref(Emax))
+        else:
+            self.model_lib.ll_init_config_(ctypes.byref(n), at.get_atomic_numbers().astype(np.int32), at.get_positions(), at.get_cell()[:,:], ctypes.byref(Emax))
 
     def eval_energy(self, at):
         n = ctypes.c_int(len(at))
@@ -153,6 +173,16 @@ class fortran_MC_MD:
             n_extra_data_c = ctypes.c_int(0)
             extra_data=np.zeros( (1) )
         return self.model_lib.ll_eval_energy_(ctypes.byref(n), at.get_atomic_numbers().astype(np.int32), at.get_positions(), ctypes.byref(n_extra_data_c), extra_data, at.get_cell()[:,:])
+
+    def eval_energy_mag(self, at):
+        n = ctypes.c_int(len(at))
+        if 'ns_extra_data' in at.arrays:
+            n_extra_data_c = ctypes.c_int(at.arrays['ns_extra_data'].size/len(at))
+            extra_data = at.arrays['ns_extra_data']
+        else:
+            n_extra_data_c = ctypes.c_int(0)
+            extra_data=np.zeros( (1) )
+        return self.model_lib.ll_eval_energy_mag_(ctypes.byref(n), at.get_positions(), at.get_initial_magnetic_moments(), ctypes.byref(n_extra_data_c), extra_data, at.get_cell()[:,:])
 
     def move_atom_1(self, at, d_i, d_pos, dEmax):
         n = ctypes.c_int(len(at))
