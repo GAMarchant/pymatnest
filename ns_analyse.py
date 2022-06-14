@@ -3,7 +3,7 @@
 from __future__ import print_function
 import numpy as np, fileinput, itertools, sys
 
-def read_inputs(args, line_skip=0, line_end=None, interval=1):
+def read_inputs(args, line_skip=0, line_end=None, interval=1, magnetic=False):
 
     inputs = fileinput.input(files=args)
 
@@ -30,6 +30,11 @@ def read_inputs(args, line_skip=0, line_end=None, interval=1):
 
     Es=[]
     Vs=[]
+    Ms=[]
+    Mxs=[]
+    Mys=[]
+    Mzs=[]
+
     lines = itertools.islice(inputs, line_skip, line_end, interval)
     n_fields = None
     for line in lines:
@@ -37,7 +42,37 @@ def read_inputs(args, line_skip=0, line_end=None, interval=1):
         if n_fields is not None and n_fields != len(fields):
             sys.stderr.write(f'Mismatch field # prev {n_fields} cur {len(fields)}, skipping\n')
             continue
-        if len(fields) == 3:
+        if len(fields) == 7:
+            try:
+                E = float(fields[1])
+                V = float(fields[2])
+                M = float(fields[3])
+                Mx = float(fields[4])
+                My = float(fields[5])
+                Mz = float(fields[6])
+            except:
+                continue
+            if n_fields is None:
+                n_fields = 7
+            Es.append(E)
+            Vs.append(V)
+            Ms.append(M)
+            Mxs.append(Mx)
+            Mys.append(My)
+            Mzs.append(Mz)
+        elif len(fields) == 4:
+            try:
+                E = float(fields[1])
+                V = float(fields[2])
+                M = float(fields[3])
+            except:
+                continue
+            if n_fields is None:
+                n_fields = 4
+            Es.append(E)
+            Vs.append(V)
+            Ms.append(M)
+        elif len(fields) == 3:
             try:
                 E = float(fields[1])
                 V = float(fields[2])
@@ -63,7 +98,28 @@ def read_inputs(args, line_skip=0, line_end=None, interval=1):
         Vs = None
     else:
         Vs = np.array(Vs)
-    return (n_walkers, n_cull, n_Extra_DOF, flat_V_prior, N_atoms, np.array(Es), Vs)
+
+    if len(Ms) == 0:
+        Ms = None
+    else:
+        Ms = np.array(Ms)
+
+    if len(Mxs) == 0:
+        Mxs = None
+    else:
+        Mxs = np.array(Mxs)
+
+    if len(Mys) == 0:
+        Mys = None
+    else:
+        Mys = np.array(Mys)
+
+    if len(Mzs) == 0:
+        Mzs = None
+    else:
+        Mzs = np.array(Mzs)
+
+    return (n_walkers, n_cull, n_Extra_DOF, flat_V_prior, N_atoms, np.array(Es), Vs, Ms, Mxs, Mys, Mzs)
 
 def calc_log_a(n_Es, n_walkers, n_cull, interval=1):
     # log_a = math.log(float(n_walkers)) - math.log(float(n_walkers+n_cull))
